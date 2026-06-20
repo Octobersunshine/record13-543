@@ -1,6 +1,8 @@
 const EventEmitter = require('events');
 const certStore = require('../data/certStore');
 const config = require('../config');
+const alertService = require('./alertService');
+const { ALERT_TYPES } = alertService;
 
 class RetryScheduler extends EventEmitter {
   constructor() {
@@ -66,22 +68,56 @@ class RetryScheduler extends EventEmitter {
 
       console.log(`[RetryScheduler] 检测到失败任务 #${task.id} (${task.domain})，已加入重试队列，下次重试: ${nextRetryTime.toISOString()}`);
 
+      const classified = alertService.classifyError(latestRecord.errorMessage);
+
       certStore.addAlert({
-        type: 'retry_scheduled',
+        type: ALERT_TYPES.RETRY_SCHEDULED,
         taskId: task.id,
         domain: task.domain,
         level: 'warning',
         title: '续期失败，已安排自动重试',
-        message: `域名 ${task.domain} 证书续期失败，已自动安排重试。失败原因: ${latestRecord.errorMessage}`,
+        message: `域名 ${task.domain} 证书续期失败（${classified.label}），已自动安排第 1 次重试。失败原因: ${latestRecord.errorMessage}`,
         metadata: {
           originalRecordId: latestRecord.id,
           attempt: 1,
           maxAttempts: this.maxAttempts,
-          nextRetryTime: nextRetryTime.toISOString()
+          nextRetryTime: nextRetryTime.toISOString(),
+          originalErrorType: classified.type,
+          originalErrorLabel: classified.label
         }
       });
 
-      this.emit('retry_scheduled', { taskId: task.id, domain: task.domain, attempt: 1 });
+      alertService.pushAlert({
+        type: ALERT_TYPES.RETRY_SCHEDULED,
+        taskId: task.id,
+        domain: task.domain,
+        title: `续期失败，已安排自动重试 - ${task.domain}`,
+        message: `域名 ${task.domain} 证书续期失败（${classified.label}），已自动安排第 1 次重试。失败原因: ${latestRecord.errorMessage}`,
+        metadata: {
+          originalRecordId: latestRecord.id,
+          attempt: 1,
+          maxAttempts: this.maxAttempts,
+          nextRetryTime: nextRetryTime.toISOString(),
+          originalErrorType: classified.type,
+          originalErrorLabel: classified.label,
+          originalErrorMessage: latestRecord.errorMessage
+        }
+      });
+
+      alertService.pushAlert({
+        type: classified.type,
+        taskId: task.id,
+        domain: task.domain,
+        title: `${classified.label} - ${task.domain}`,
+        message: `域名 ${task.domain} 证书续期失败，原因：${latestRecord.errorMessage}。已自动安排重试。`,
+        metadata: {
+          errorMessage: latestRecord.errorMessage,
+          errorType: classified.type,
+          errorLabel: classified.label
+        }
+      });
+
+      this.emit('retry_scheduled', { taskId: task.id, domain: task.domain, attempt: 1, errorType: classified.type });
     }
   }
 
@@ -136,11 +172,24 @@ class RetryScheduler extends EventEmitter {
       console.log(`[RetryScheduler] 重试成功！任务 #${item.taskId} (${item.domain})，第 ${item.attempt} 次重试`);
 
       certStore.addAlert({
-        type: 'retry_success',
+        type: ALERT_TYPES.RETRY_SUCCESS,
         taskId: item.taskId,
         domain: item.domain,
         level: 'info',
         title: '续期重试成功',
+        message: `域名 ${item.domain} 证书续期重试成功（第 ${item.attempt} 次重试），新证书有效期至 ${result.newCertExpire}`,
+        metadata: {
+          retryAttempt: item.attempt,
+          newRecordId: newRecord.id,
+          newCertExpire: result.newCertExpire
+        }
+      });
+
+      alertService.pushAlert({
+        type: ALERT_TYPES.RETRY_SUCCESS,
+        taskId: item.taskId,
+        domain: item.domain,
+        title: `续期重试成功 - ${item.domain}`,
         message: `域名 ${item.domain} 证书续期重试成功（第 ${item.attempt} 次重试），新证书有效期至 ${result.newCertExpire}`,
         metadata: {
           retryAttempt: item.attempt,
@@ -157,6 +206,8 @@ class RetryScheduler extends EventEmitter {
       });
 
     } else {
+      const classified = alertService.classifyError(result.error);
+
       if (item.attempt >= item.maxAttempts) {
         certStore.updateRetryQueueItem(item.id, {
           status: 'completed',
@@ -168,15 +219,46 @@ class RetryScheduler extends EventEmitter {
         console.error(`[RetryScheduler] 重试已耗尽！任务 #${item.taskId} (${item.domain})，已重试 ${item.maxAttempts} 次均失败`);
 
         certStore.addAlert({
-          type: 'retry_exhausted',
+          type: ALERT_TYPES.RETRY_EXHAUSTED,
           taskId: item.taskId,
           domain: item.domain,
           level: 'critical',
           title: '续期重试已耗尽，需人工介入',
-          message: `域名 ${item.domain} 证书续期已重试 ${item.maxAttempts} 次均失败，证书即将过期，请立即人工处理！最后错误: ${result.error}`,
+          message: `域名 ${item.domain} 证书续期已重试 ${item.maxAttempts} 次均失败（${classified.label}），证书即将过期，请立即人工处理！最后错误: ${result.error}`,
           metadata: {
             totalAttempts: item.maxAttempts,
-            lastError: result.error
+            lastError: result.error,
+            lastErrorType: classified.type,
+            lastErrorLabel: classified.label
+          }
+        });
+
+        alertService.pushAlert({
+          type: ALERT_TYPES.RETRY_EXHAUSTED,
+          taskId: item.taskId,
+          domain: item.domain,
+          title: `【紧急】续期重试已耗尽，需人工介入 - ${item.domain}`,
+          message: `域名 ${item.domain} 证书续期已重试 ${item.maxAttempts} 次均失败（${classified.label}），证书即将过期，请立即人工处理！最后错误: ${result.error}`,
+          metadata: {
+            totalAttempts: item.maxAttempts,
+            lastError: result.error,
+            lastErrorType: classified.type,
+            lastErrorLabel: classified.label
+          }
+        });
+
+        alertService.pushAlert({
+          type: classified.type,
+          taskId: item.taskId,
+          domain: item.domain,
+          title: `【紧急】${classified.label} - ${item.domain}`,
+          message: `域名 ${item.domain} 证书续期失败（${classified.label}），${item.maxAttempts} 次重试均失败，需立即人工处理。错误详情: ${result.error}`,
+          metadata: {
+            errorMessage: result.error,
+            errorType: classified.type,
+            errorLabel: classified.label,
+            totalAttempts: item.maxAttempts,
+            retryExhausted: true
           }
         });
 
@@ -184,7 +266,8 @@ class RetryScheduler extends EventEmitter {
           taskId: item.taskId,
           domain: item.domain,
           totalAttempts: item.maxAttempts,
-          lastError: result.error
+          lastError: result.error,
+          errorType: classified.type
         });
 
       } else {
@@ -203,17 +286,51 @@ class RetryScheduler extends EventEmitter {
         console.warn(`[RetryScheduler] 重试失败，任务 #${item.taskId} (${item.domain})，第 ${item.attempt} 次重试失败，下次重试: ${nextRetryTime.toISOString()}`);
 
         certStore.addAlert({
-          type: 'retry_failed',
+          type: ALERT_TYPES.RETRY_FAILED,
           taskId: item.taskId,
           domain: item.domain,
           level: 'warning',
           title: '续期重试失败，将再次重试',
-          message: `域名 ${item.domain} 证书续期第 ${item.attempt} 次重试失败，将在 ${this._formatDuration(nextRetryTime - new Date())} 后进行第 ${nextAttempt} 次重试。错误: ${result.error}`,
+          message: `域名 ${item.domain} 证书续期第 ${item.attempt} 次重试失败（${classified.label}），将在 ${this._formatDuration(nextRetryTime - new Date())} 后进行第 ${nextAttempt} 次重试。错误: ${result.error}`,
           metadata: {
             attempt: item.attempt,
             nextAttempt,
             nextRetryTime: nextRetryTime.toISOString(),
-            error: result.error
+            error: result.error,
+            errorType: classified.type,
+            errorLabel: classified.label
+          }
+        });
+
+        alertService.pushAlert({
+          type: ALERT_TYPES.RETRY_FAILED,
+          taskId: item.taskId,
+          domain: item.domain,
+          title: `续期重试失败，将再次重试 - ${item.domain}`,
+          message: `域名 ${item.domain} 证书续期第 ${item.attempt} 次重试失败（${classified.label}），将在 ${this._formatDuration(nextRetryTime - new Date())} 后进行第 ${nextAttempt} 次重试。错误: ${result.error}`,
+          metadata: {
+            attempt: item.attempt,
+            nextAttempt,
+            nextRetryTime: nextRetryTime.toISOString(),
+            error: result.error,
+            errorType: classified.type,
+            errorLabel: classified.label
+          }
+        });
+
+        alertService.pushAlert({
+          type: classified.type,
+          taskId: item.taskId,
+          domain: item.domain,
+          title: `${classified.label} - ${item.domain}`,
+          message: `域名 ${item.domain} 证书续期失败（${classified.label}），第 ${item.attempt} 次重试失败。错误详情: ${result.error}`,
+          metadata: {
+            errorMessage: result.error,
+            errorType: classified.type,
+            errorLabel: classified.label,
+            attempt: item.attempt,
+            nextAttempt,
+            nextRetryTime: nextRetryTime.toISOString()
           }
         });
 
@@ -223,7 +340,8 @@ class RetryScheduler extends EventEmitter {
           attempt: item.attempt,
           nextAttempt,
           nextRetryTime,
-          error: result.error
+          error: result.error,
+          errorType: classified.type
         });
       }
     }
@@ -267,11 +385,11 @@ class RetryScheduler extends EventEmitter {
     }
 
     const errors = [
-      'ACME challenge verification timeout',
-      'DNS propagation delay',
-      'Rate limit exceeded from CA',
+      'Timeout during ACME http-01 challenge: connection refused on port 80',
+      'DNS TXT record not propagated after 30 attempts',
+      'Rate limit exceeded from CA: too many requests',
       'Connection refused on port 443',
-      'Certificate signing request rejected'
+      'Certificate signing request rejected by CA'
     ];
     const error = errors[Math.floor(Math.random() * errors.length)];
     return { success: false, error };
@@ -309,6 +427,19 @@ class RetryScheduler extends EventEmitter {
     });
 
     console.log(`[RetryScheduler] 手动触发重试: 任务 #${task.id} (${task.domain})`);
+
+    alertService.pushAlert({
+      type: ALERT_TYPES.RETRY_MANUAL_TRIGGERED,
+      taskId: task.id,
+      domain: task.domain,
+      title: `手动触发重试 - ${task.domain}`,
+      message: `域名 ${task.domain} 证书续期已手动触发重试，将在 5 秒后开始执行。`,
+      metadata: {
+        triggerType: 'manual',
+        originalRecordId: latestRecord.id,
+        nextRetryTime: nextRetryTime.toISOString()
+      }
+    });
 
     this.emit('manual_retry', { taskId: task.id, domain: task.domain });
 

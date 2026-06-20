@@ -1,6 +1,8 @@
 const EventEmitter = require('events');
 const certStore = require('../data/certStore');
 const config = require('../config');
+const alertService = require('./alertService');
+const { ALERT_TYPES } = alertService;
 
 class ExpiryMonitor extends EventEmitter {
   constructor() {
@@ -64,24 +66,45 @@ class ExpiryMonitor extends EventEmitter {
     certStore.updateTaskStatus(task.id, 'expired');
     this.stats.totalExpired++;
 
-    console.error(`[ExpiryMonitor] ⚠️ 证书已过期！域名: ${task.domain}，已过期 ${Math.abs(daysRemaining)} 天`);
+    const expiredDays = Math.abs(daysRemaining);
+    console.error(`[ExpiryMonitor] 🔴 证书已过期！域名: ${task.domain}，已过期 ${expiredDays} 天`);
+
+    const severityLevel = expiredDays > 7 ? 'critical' : expiredDays > 3 ? 'critical' : 'critical';
 
     certStore.addAlert({
-      type: 'cert_expired',
+      type: ALERT_TYPES.CERT_EXPIRED,
       taskId: task.id,
       domain: task.domain,
-      level: 'critical',
-      title: '证书已过期，业务站点可能无法访问',
-      message: `域名 ${task.domain} 的 SSL/TLS 证书已于 ${Math.abs(daysRemaining)} 天前过期，业务站点可能无法正常访问！请立即手动续期。`,
+      level: severityLevel,
+      title: `证书已过期 ${expiredDays} 天，业务站点可能无法访问`,
+      message: `域名 ${task.domain} 的 SSL/TLS 证书已于 ${expiredDays} 天前过期，业务站点可能无法正常访问！请立即手动续期。`,
       metadata: {
         daysRemaining,
+        expiredDays,
         expireDate: task.expireDate,
         certType: task.certType,
-        issuer: task.issuer
+        issuer: task.issuer,
+        severity: expiredDays > 7 ? 'extreme' : expiredDays > 3 ? 'severe' : 'urgent'
       }
     });
 
-    this.emit('cert_expired', { task, daysRemaining });
+    alertService.pushAlert({
+      type: ALERT_TYPES.CERT_EXPIRED,
+      taskId: task.id,
+      domain: task.domain,
+      title: `【紧急】证书已过期 ${expiredDays} 天 - ${task.domain}`,
+      message: `域名 ${task.domain} 的 SSL/TLS 证书已于 ${expiredDays} 天前过期，业务站点可能无法正常访问！请立即手动续期。证书信息：类型=${task.certType}，颁发机构=${task.issuer}，到期日=${task.expireDate}`,
+      metadata: {
+        daysRemaining,
+        expiredDays,
+        expireDate: task.expireDate,
+        certType: task.certType,
+        issuer: task.issuer,
+        severity: expiredDays > 7 ? 'extreme' : expiredDays > 3 ? 'severe' : 'urgent'
+      }
+    });
+
+    this.emit('cert_expired', { task, daysRemaining, expiredDays });
   }
 
   _handleCritical(task, daysRemaining) {
@@ -89,44 +112,76 @@ class ExpiryMonitor extends EventEmitter {
 
     const latestRecord = certStore.getLatestRecord(task.id);
     const hasRetryInProgress = certStore.getRetryQueueByTaskId(task.id).some(q => q.status === 'pending' || q.status === 'retrying');
+    const latestStatus = latestRecord ? latestRecord.status : 'none';
 
-    if (!hasRetryInProgress && (!latestRecord || latestRecord.status === 'failed')) {
+    if (!hasRetryInProgress && latestStatus !== 'success') {
       console.warn(`[ExpiryMonitor] 🔴 紧急：域名 ${task.domain} 证书将在 ${daysRemaining} 天后过期，且无重试进行中`);
 
       certStore.addAlert({
-        type: 'cert_critical',
+        type: ALERT_TYPES.CERT_CRITICAL,
         taskId: task.id,
         domain: task.domain,
         level: 'critical',
-        title: '证书即将过期，需紧急处理',
-        message: `域名 ${task.domain} 的证书将在 ${daysRemaining} 天后过期，且续期失败无重试进行中。请立即手动续期或触发重试！`,
+        title: `证书将在 ${daysRemaining} 天后过期，需紧急处理`,
+        message: `域名 ${task.domain} 的证书将在 ${daysRemaining} 天后过期，且续期状态异常（${latestStatus}），无重试进行中。请立即手动续期或触发重试！`,
         metadata: {
           daysRemaining,
           expireDate: task.expireDate,
-          latestRecordStatus: latestRecord ? latestRecord.status : 'none',
-          hasRetryInProgress: false
+          latestRecordStatus: latestStatus,
+          hasRetryInProgress: false,
+          urgency: daysRemaining <= 1 ? 'immediate' : daysRemaining <= 3 ? 'urgent' : 'important'
         }
       });
 
-      this.emit('cert_critical', { task, daysRemaining, hasRetryInProgress: false });
+      alertService.pushAlert({
+        type: ALERT_TYPES.CERT_CRITICAL,
+        taskId: task.id,
+        domain: task.domain,
+        title: `【紧急】证书将在 ${daysRemaining} 天后过期 - ${task.domain}`,
+        message: `域名 ${task.domain} 的证书将在 ${daysRemaining} 天后过期，且续期失败无重试进行中。请立即手动续期或触发重试！到期日: ${task.expireDate}`,
+        metadata: {
+          daysRemaining,
+          expireDate: task.expireDate,
+          latestRecordStatus: latestStatus,
+          hasRetryInProgress: false,
+          urgency: daysRemaining <= 1 ? 'immediate' : daysRemaining <= 3 ? 'urgent' : 'important'
+        }
+      });
+
+      this.emit('cert_critical', { task, daysRemaining, hasRetryInProgress: false, latestStatus });
     } else {
-      console.info(`[ExpiryMonitor] 🔴 紧急：域名 ${task.domain} 证书将在 ${daysRemaining} 天后过期（重试进行中）`);
+      console.info(`[ExpiryMonitor] 🟠 紧急：域名 ${task.domain} 证书将在 ${daysRemaining} 天后过期（重试进行中）`);
 
       certStore.addAlert({
-        type: 'cert_critical',
+        type: ALERT_TYPES.CERT_CRITICAL,
         taskId: task.id,
         domain: task.domain,
         level: 'warning',
-        title: '证书即将过期，重试进行中',
+        title: `证书将在 ${daysRemaining} 天后过期，重试进行中`,
         message: `域名 ${task.domain} 的证书将在 ${daysRemaining} 天后过期，自动重试正在进行中。若重试失败，请立即手动处理。`,
         metadata: {
           daysRemaining,
           expireDate: task.expireDate,
-          hasRetryInProgress: true
+          hasRetryInProgress: true,
+          urgency: daysRemaining <= 1 ? 'immediate' : daysRemaining <= 3 ? 'urgent' : 'important'
         }
       });
 
-      this.emit('cert_critical', { task, daysRemaining, hasRetryInProgress: true });
+      alertService.pushAlert({
+        type: ALERT_TYPES.CERT_CRITICAL,
+        taskId: task.id,
+        domain: task.domain,
+        title: `证书将在 ${daysRemaining} 天后过期（重试中） - ${task.domain}`,
+        message: `域名 ${task.domain} 的证书将在 ${daysRemaining} 天后过期，自动重试正在进行中。若重试失败，请立即手动处理。到期日: ${task.expireDate}`,
+        metadata: {
+          daysRemaining,
+          expireDate: task.expireDate,
+          hasRetryInProgress: true,
+          urgency: daysRemaining <= 1 ? 'immediate' : daysRemaining <= 3 ? 'urgent' : 'important'
+        }
+      });
+
+      this.emit('cert_critical', { task, daysRemaining, hasRetryInProgress: true, latestStatus });
     }
   }
 
@@ -134,25 +189,41 @@ class ExpiryMonitor extends EventEmitter {
     this.stats.totalWarnings++;
 
     const latestRecord = certStore.getLatestRecord(task.id);
+    const latestStatus = latestRecord ? latestRecord.status : 'none';
 
-    if (!latestRecord || latestRecord.status !== 'success') {
+    if (latestStatus !== 'success') {
       console.warn(`[ExpiryMonitor] 🟡 预警：域名 ${task.domain} 证书将在 ${daysRemaining} 天后过期，续期状态异常`);
 
       certStore.addAlert({
-        type: 'cert_warning',
+        type: ALERT_TYPES.CERT_WARNING,
         taskId: task.id,
         domain: task.domain,
         level: 'warning',
-        title: '证书即将过期预警',
-        message: `域名 ${task.domain} 的证书将在 ${daysRemaining} 天后过期，请确认续期安排。`,
+        title: `证书将在 ${daysRemaining} 天后过期预警`,
+        message: `域名 ${task.domain} 的证书将在 ${daysRemaining} 天后过期，请确认续期安排。当前续期状态: ${latestStatus}`,
         metadata: {
           daysRemaining,
           expireDate: task.expireDate,
-          latestRecordStatus: latestRecord ? latestRecord.status : 'none'
+          latestRecordStatus: latestStatus,
+          urgency: daysRemaining <= 15 ? 'important' : 'notice'
         }
       });
 
-      this.emit('cert_warning', { task, daysRemaining });
+      alertService.pushAlert({
+        type: ALERT_TYPES.CERT_WARNING,
+        taskId: task.id,
+        domain: task.domain,
+        title: `证书将在 ${daysRemaining} 天后过期预警 - ${task.domain}`,
+        message: `域名 ${task.domain} 的证书将在 ${daysRemaining} 天后过期，请确认续期安排。当前续期状态: ${latestStatus}，到期日: ${task.expireDate}`,
+        metadata: {
+          daysRemaining,
+          expireDate: task.expireDate,
+          latestRecordStatus: latestStatus,
+          urgency: daysRemaining <= 15 ? 'important' : 'notice'
+        }
+      });
+
+      this.emit('cert_warning', { task, daysRemaining, latestStatus });
     }
   }
 

@@ -3,6 +3,7 @@ const router = express.Router();
 const certStore = require('../data/certStore');
 const retryScheduler = require('../services/retryScheduler');
 const expiryMonitor = require('../services/expiryMonitor');
+const alertService = require('../services/alertService');
 
 router.get('/tasks', (req, res) => {
   const tasks = certStore.getAllTasks();
@@ -291,6 +292,80 @@ router.post('/alerts/:id/acknowledge', (req, res) => {
     code: 0,
     message: '告警已确认',
     data: alert
+  });
+});
+
+router.get('/alerts/types', (req, res) => {
+  const types = alertService.getAllAlertTypes();
+  res.json({
+    code: 0,
+    message: 'success',
+    data: types,
+    total: types.length
+  });
+});
+
+router.get('/alerts/categories', (req, res) => {
+  const categories = alertService.getAllCategories();
+  res.json({
+    code: 0,
+    message: 'success',
+    data: categories,
+    total: categories.length
+  });
+});
+
+router.get('/alerts/classify', (req, res) => {
+  const { error } = req.query;
+  if (!error) {
+    return res.status(400).json({
+      code: 400,
+      message: '请提供 error 参数',
+      data: null
+    });
+  }
+  const classified = alertService.classifyError(decodeURIComponent(error));
+  res.json({
+    code: 0,
+    message: 'success',
+    data: classified
+  });
+});
+
+router.get('/alerts/push/history', (req, res) => {
+  const { type, level, category, taskId, domain, limit } = req.query;
+  const options = {};
+  if (type) options.type = type;
+  if (level) options.level = level;
+  if (category) options.category = category;
+  if (taskId) options.taskId = taskId;
+  if (domain) options.domain = domain;
+  if (limit) options.limit = parseInt(limit);
+
+  const history = alertService.getPushHistory(options);
+  res.json({
+    code: 0,
+    message: 'success',
+    data: history,
+    total: history.length
+  });
+});
+
+router.get('/alerts/push/stats', (req, res) => {
+  const stats = alertService.getAlertStats();
+  res.json({
+    code: 0,
+    message: 'success',
+    data: stats
+  });
+});
+
+router.post('/alerts/dedup/clear', (req, res) => {
+  const count = alertService.clearDedupCache();
+  res.json({
+    code: 0,
+    message: '告警去重缓存已清除',
+    data: { clearedCount: count }
   });
 });
 
