@@ -1,0 +1,13 @@
+{
+  "name": "cert-renewal-status",
+  "version": "1.0.0",
+  "description": "查询域名证书续期任务状态，返回最近一次续期执行结果",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node --watch app.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
